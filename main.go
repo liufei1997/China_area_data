@@ -206,8 +206,8 @@ func GetProvinceUrlAndData(prefixUrl string) (provinces []Province, err error) {
 		}
 
 		for j := 0; j < len(provs[i].Cities); j++ {
-
-			if provs[i].Cities[j].Name == "东莞市" || provs[i].Cities[j].Name == "中山市" {
+			// 因为 东莞市 ， 中山市,和 海南下面的儋州市 这个三个市区下面就是镇，单独进行逻辑处理，并将镇存储到第三级数据，即区级里面
+			if provs[i].Cities[j].Name == "东莞市" || provs[i].Cities[j].Name == "中山市" || provs[i].Cities[j].Name == "儋州市" {
 				towns, GetTownOfDonguanAndhongshanErr := GetTownOfDonguanAndhongshan(prefixUrl, (provs[i].Cities[j]).Link)
 				if GetTownOfDonguanAndhongshanErr == nil {
 					(provs[i].Cities[j]).Counties = towns
@@ -470,3 +470,6 @@ func prepareData(provinces []Province) []ProvinceCityRegionModel {
 	}
 	return regions
 }
+
+
+
