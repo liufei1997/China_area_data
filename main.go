@@ -1,6 +1,10 @@
 package main
 
 import (
+	"China_area_data/models"
+	"archive/zip"
+	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,15 +16,16 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type ProvinceCityRegionModel struct {
-	ProvinceCode      int    `gorm:"column:province_code" sql:"type:int(11)" json:"province_code"`
-	ProvinceName      string `gorm:"column:province_name" sql:"type:varchar(128)" json:"province_name"`
-	CityCode          int    `gorm:"column:city_code" sql:"type:int(11)" json:"city_code"`
-	CityName          string `gorm:"column:city_name" sql:"type:varchar(128)" json:"city_name"`
-	RegionCode        int    `gorm:"column:region_code" sql:"type:int(11)" json:"region_code"`
-	RegionName        string `gorm:"column:region_name" sql:"type:varchar(128)" json:"region_name"`
+	ProvinceCode int    `gorm:"column:province_code" sql:"type:int(11)" json:"province_code"`
+	ProvinceName string `gorm:"column:province_name" sql:"type:varchar(128)" json:"province_name"`
+	CityCode     int    `gorm:"column:city_code" sql:"type:int(11)" json:"city_code"`
+	CityName     string `gorm:"column:city_name" sql:"type:varchar(128)" json:"city_name"`
+	RegionCode   int    `gorm:"column:region_code" sql:"type:int(11)" json:"region_code"`
+	RegionName   string `gorm:"column:region_name" sql:"type:varchar(128)" json:"region_name"`
 }
 
 type PublishRecord struct {
@@ -49,6 +54,10 @@ type County struct {
 	Name string `json:"name"`
 	Link string `json:"-"`
 }
+
+var db *gorm.DB
+
+// clog.Logger.Error() 为日志打印，请自我实现
 
 func main() {
 	GetChinaAreaData()
@@ -227,28 +236,6 @@ func GetProvinceUrlAndData(prefixUrl string) (provinces []Province, err error) {
 			}
 		}
 	}
-
-	// 单独增加下面三个地区
-	xianggang := Province{
-		Code:   81,
-		Name:   "香港特别行政区",
-		Link:   "",
-		Cities: nil,
-	}
-	aomeng := Province{
-		Code:   82,
-		Name:   "澳门特别行政区",
-		Link:   "",
-		Cities: nil,
-	}
-	taiwang := Province{
-		Code:   71,
-		Name:   "台湾省",
-		Link:   "",
-		Cities: nil,
-	}
-
-	provs = append(provs, xianggang, aomeng, taiwang)
 	return
 }
 
@@ -437,32 +424,32 @@ func prepareData(provinces []Province) []ProvinceCityRegionModel {
 	regions := make([]ProvinceCityRegionModel, 0)
 	for _, p := range provinces {
 		pro := ProvinceCityRegionModel{
-			ProvinceCode:      p.Code,
-			ProvinceName:      p.Name,
-			CityCode:          0,
-			CityName:          "",
-			RegionCode:        0,
-			RegionName:        "",
+			ProvinceCode: p.Code,
+			ProvinceName: p.Name,
+			CityCode:     0,
+			CityName:     "",
+			RegionCode:   0,
+			RegionName:   "",
 		}
 		regions = append(regions, pro)
 		for _, city := range p.Cities {
 			cty := ProvinceCityRegionModel{
-				ProvinceCode:      p.Code,
-				ProvinceName:      p.Name,
-				CityCode:          city.Code,
-				CityName:          city.Name,
-				RegionCode:        0,
-				RegionName:        "",
+				ProvinceCode: p.Code,
+				ProvinceName: p.Name,
+				CityCode:     city.Code,
+				CityName:     city.Name,
+				RegionCode:   0,
+				RegionName:   "",
 			}
 			regions = append(regions, cty)
 			for _, county := range city.Counties {
 				region := ProvinceCityRegionModel{
-					ProvinceCode:      p.Code,
-					ProvinceName:      p.Name,
-					CityCode:          city.Code,
-					CityName:          city.Name,
-					RegionCode:        county.Code,
-					RegionName:        county.Name,
+					ProvinceCode: p.Code,
+					ProvinceName: p.Name,
+					CityCode:     city.Code,
+					CityName:     city.Name,
+					RegionCode:   county.Code,
+					RegionName:   county.Name,
 				}
 				regions = append(regions, region)
 			}
@@ -471,5 +458,156 @@ func prepareData(provinces []Province) []ProvinceCityRegionModel {
 	return regions
 }
 
+// 将数据库中省市区数据对应爬虫记录存到数据库
+func ProvideMapDataZipFile(updateAt string) error {
+	integrity := verifyDataIntegrity()
+	if !integrity {
+		clog.Logger.Error("data is not complete")
+		return errors.New("data is not complete")
+	}
 
+	areaList := models.ProvinceCityRegionModelList{}
+	err := areaList.GetAllOrderAsc()
+	if err != nil {
+		clog.Logger.Error("areaList.GetAll error:%v", err)
+		return err
+	}
 
+	var provinceData [][]string
+	var provinceHeader = []string{"province_id", "province_name", "first_letter"}
+	provinceData = append(provinceData, provinceHeader)
+
+	var cityData [][]string
+	var cityHeader = []string{"city_id", "city_name", "parent_id"}
+	cityData = append(cityData, cityHeader)
+
+	var countyData [][]string
+	var countyHeader = []string{"county_id", "county_name", "parent_id"}
+	countyData = append(countyData, countyHeader)
+
+	for _, data := range areaList {
+		// 省级数据
+		if data.CityCode == 0 {
+			province := []string{strconv.Itoa(data.ProvinceCode), data.ProvinceName, data.ProvinceNamePy[0:1]}
+			provinceData = append(provinceData, province)
+		} else if data.RegionCode == 0 {
+			// 市级数据
+			city := []string{strconv.Itoa(data.CityCode), data.CityName, strconv.Itoa(data.ProvinceCode)}
+			cityData = append(cityData, city)
+		} else {
+			county := []string{strconv.Itoa(data.RegionCode), data.RegionName, strconv.Itoa(data.CityCode)}
+			countyData = append(countyData, county)
+		}
+	}
+	provinceCSV, err := generateCSV(provinceData)
+	if err != nil {
+		clog.Logger.Error("generate province.csv err:%v", err)
+		return err
+	}
+	cityCSV, err := generateCSV(cityData)
+	if err != nil {
+		clog.Logger.Error("generate city.csv err:%v", err)
+		return err
+	}
+	countyCSV, err := generateCSV(countyData)
+	if err != nil {
+		clog.Logger.Error("generate county.csv err:%v", err)
+		return err
+	}
+	provinceCSVName := "province"
+	cityCSVName := "city"
+	countyCSVName := "county"
+	provinceCSVFile := models.CsvFile{
+		Name: fmt.Sprintf("%s.csv", provinceCSVName),
+		Data: provinceCSV,
+	}
+	cityCSVFile := models.CsvFile{
+		Name: fmt.Sprintf("%s.csv", cityCSVName),
+		Data: cityCSV,
+	}
+	countyCSVFile := models.CsvFile{
+		Name: fmt.Sprintf("%s.csv", countyCSVName),
+		Data: countyCSV,
+	}
+	files := make([]models.CsvFile, 0)
+	files = append(files, provinceCSVFile, cityCSVFile, countyCSVFile)
+	zipData, err := BytesZip(files)
+	fmt.Println(zipData)
+	if err != nil {
+		clog.Logger.Error("BytesZip err:%v", err)
+		return err
+	}
+	// 此处 将 zipData 上传到 oss 得到 下载链接 downUrl，请自我实现
+	var downUrl string
+	if err != nil {
+		clog.Logger.Error("cds.UploadFile err:%v", err)
+		return err
+	}
+	fetchRecord := models.FetchRecord{
+		Id:         0,
+		UpdateTime: time.Now().Format("2006-01-02 15:04:05"),
+		UpdateAt:   updateAt,
+		DownUrl:    downUrl,
+	}
+	err = fetchRecord.Create(db)
+	if err != nil {
+		clog.Logger.Error("FetchRecord Create err:%v", err)
+		return err
+	}
+	return nil
+}
+
+// 验证数据库中数据是否完整，即保证完整的三级结构
+func verifyDataIntegrity() bool {
+	provinceList := models.ProvinceCityRegionModelList{}
+	provinceList.GetAllProvince()
+	provinceCodes := make([]int, 0)
+	for i := 0; i < len(provinceList); i++ {
+		provinceCodes = append(provinceCodes, provinceList[i].ProvinceCode)
+	}
+	for _, provinceCode := range provinceCodes {
+		tempCityList := models.ProvinceCityRegionModelList{}
+		tempCityList.GetCityListOfSingleProvince(provinceCode)
+		for i := 0; i < len(tempCityList); i++ {
+			// 判断该市是否有区
+			var city models.ProvinceCityRegionModel
+			hasCounty := city.HasCounty(tempCityList[i].CityCode)
+			if hasCounty {
+				continue
+			} else {
+				clog.Logger.Error("city_code 为 %d 的数据不完整", tempCityList[i].CityCode)
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// 生成CSV文件
+func generateCSV(rows [][]string) ([]byte, error) {
+	buf := bytes.NewBuffer(nil)
+	w := csv.NewWriter(buf)
+	err := w.WriteAll(rows)
+	return buf.Bytes(), err
+}
+
+// 压缩CSV文件
+func BytesZip(files []models.CsvFile) ([]byte, error) {
+	buff := new(bytes.Buffer)
+	w := zip.NewWriter(buff)
+	for _, v := range files {
+		ww, err := w.Create(v.Name)
+		if err != nil {
+			return nil, err
+		}
+		_, err = ww.Write(v.Data)
+		if err != nil {
+			return nil, err
+		}
+	}
+	err := w.Close()
+	if err != nil {
+		return nil, err
+	}
+	return buff.Bytes(), nil
+}
